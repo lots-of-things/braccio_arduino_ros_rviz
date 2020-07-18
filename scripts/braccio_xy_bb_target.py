@@ -20,11 +20,13 @@ def cart2pol(x, y):
     phi = np.arctan2(y, x)
     return(rho, phi)
 
-l = 1
+l = 1/np.cos(0.26)
 
 def get_targets(x,y):
     r, phi = cart2pol(x,y)
     if r > l*np.cos(0.26) or r < l*np.cos(0.77):
+        print '++++++ Not in Domain ++++++'
+        print 'r = ' + str(r)
         print '++++++ Not in Domain ++++++'
         return None
     theta_shoulder = np.arccos(r/l)
@@ -46,20 +48,64 @@ class BraccioXYBBTargetInterface(object):
 
     self.bounding_box = Int16MultiArray()
     self.subscriber = rospy.Subscriber("bounding_box",  Int16MultiArray, self.callback, queue_size=1)
+    self.R = np.array([[1,0],[0,1]])
+    self.scale = 1
+    self.x0 = 0
+    self.y0 = 0
 
   def callback(self, ros_data):
-    self.bounding_box = ros_data
+    self.bounding_box = ros_data.data
 
-  def go_to_joint_state(self):
+  def transform(self, x1, y1):
+    return self.R.dot([x1-self.x0, y1-self.y0]/self.scale)
 
-    print 'pos x?'
-    tst = raw_input()
-    if tst!='':
-        x = float(tst)
-    print 'pos y?'
-    tst = raw_input()
-    if tst!='':
-        y = float(tst)
+  def transform_bb(self):
+    x, y = self.bounding_box_center()
+    return self.transform(x,y)
+
+  def bounding_box_center(self):
+    x = (self.bounding_box[1]+self.bounding_box[3])/2
+    y = (self.bounding_box[2]+self.bounding_box[4])/2
+    return x, y
+
+  def calibrate(self):
+    print 'place apple at base, when ready press enter'
+    raw_input()
+
+    x0s = []
+    y0s = []
+    for i in range(10):
+      x, y = self.bounding_box_center()
+      x0s.append(x)
+      y0s.append(y)
+      time.sleep(1)
+
+    x0 = np.mean(x0s)
+    y0 = np.mean(y0s)
+    print 'place apple at furthest extent centered, when ready press enter'
+    raw_input()
+
+    x1s = []
+    y1s = []
+    for i in range(10):
+      x, y = self.bounding_box_center()
+      x1s.append(x)
+      y1s.append(y)
+      time.sleep(1)
+    x1 = np.mean(x1s)
+    y1 = np.mean(y1s)
+
+    self.x0 = x0
+    self.y0 = y0
+
+    ang = np.arctan2(1,0) - np.arctan2(y1-y0,x1-x0)
+    self.R = np.array([[np.cos(ang),-np.sin(ang)],[np.sin(ang),np.cos(ang)]])
+    v = np.array([x1-self.x0,y1-self.y0])
+    self.scale = np.sqrt(v.dot(v.T))
+    print 'calibration done.'
+    print self.transform_bb()
+
+  def go_to(self, x, y):
 
     joint_targets = get_targets(x,y)
 
@@ -79,7 +125,22 @@ class BraccioXYBBTargetInterface(object):
 
         self.move_group.stop()
 
-        current_joints = self.move_group.get_current_joint_values()
+  def go_to_joint_state(self):
+
+    print 'pos x?'
+    tst = raw_input()
+    if tst!='':
+        x = float(tst)
+    print 'pos y?'
+    tst = raw_input()
+    if tst!='':
+        y = float(tst)
+
+    self.go_to(x, y)
+
+  def go_to_target_joint_state(self):
+    v = self.transform_bb()
+    self.go_to(v[0], v[1])
 
   def go_to_home_state(self):
 
@@ -114,20 +175,26 @@ class BraccioXYBBTargetInterface(object):
 
   def print_pose(self):
     print self.move_group.get_current_pose().pose
-    print self.bounding_box
+    x, y = self.bounding_box_center()
+    print x, y
+    print self.transform(x, y)
 
 def main():
   try:
     bb_targetter = BraccioXYBBTargetInterface()
 
     while True:
-        print "============ instructions: p=print, c=control, h=home, u=up, q=quit"
+        print "============ instructions: p=print, c=calibrate, t=target, m=manual, h=home, u=up, q=quit"
         inp = raw_input()
         if inp=='q':
             break
         if inp=='p':
             bb_targetter.print_pose()
         if inp=='c':
+            bb_targetter.calibrate()
+        if inp=='t':
+            bb_targetter.go_to_target_joint_state()
+        if inp=='m':
             bb_targetter.go_to_joint_state()
         if inp=='h':
             bb_targetter.go_to_home_state()
