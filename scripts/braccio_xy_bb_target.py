@@ -9,10 +9,16 @@ import moveit_msgs.msg
 import geometry_msgs.msg
 from math import pi
 from std_msgs.msg import String, Int16MultiArray
+from sensor_msgs.msg import CompressedImage
 
 from moveit_commander.conversions import pose_to_list
 ## END_SUB_TUTORIAL
 import numpy as np
+import cv2
+import json
+
+THETA_EXT = 0.27
+THETA_RET = np.pi/4
 
 
 def cart2pol(x, y):
@@ -20,20 +26,15 @@ def cart2pol(x, y):
     phi = np.arctan2(y, x)
     return(rho, phi)
 
-l = 1/np.cos(0.26)
+def pol2cart(rho, phi):
+    x = rho*np.cos(phi)
+    y = rho*np.sin(phi)
+    return(x, y)
 
-def get_targets(x,y):
-    r, phi = cart2pol(x,y)
-    if r > l*np.cos(0.26) or r < l*np.cos(0.77):
-        print '++++++ Not in Domain ++++++'
-        print 'r = ' + str(r)
-        print '++++++ Not in Domain ++++++'
-        return None
-    theta_shoulder = np.arccos(r/l)
-    theta_wrist = theta_shoulder + np.pi/2
-    theta_elbow = np.pi/2 - 2*theta_shoulder
-    return [phi, theta_shoulder, theta_elbow, theta_wrist]
-
+def get_other_angles(theta_shoulder):
+  theta_wrist = theta_shoulder + np.pi/2
+  theta_elbow = np.pi/2 - 2*theta_shoulder
+  return theta_wrist, theta_elbow
 
 class BraccioXYBBTargetInterface(object):
   """BraccioXYBBTargetInterface"""
@@ -46,18 +47,31 @@ class BraccioXYBBTargetInterface(object):
     group_name = "braccio_arm"
     self.move_group = moveit_commander.MoveGroupCommander(group_name)
 
-    self.bounding_box = Int16MultiArray()
-    self.subscriber = rospy.Subscriber("bounding_box",  Int16MultiArray, self.callback, queue_size=1)
-    self.R = np.array([[1,0],[0,1]])
-    self.scale = 1
-    self.x0 = 0
-    self.y0 = 0
+    self.gripper_group = moveit_commander.MoveGroupCommander("braccio_gripper")
 
-  def callback(self, ros_data):
+    self.bounding_box = [0,0,0,0,0]
+    self.subscriber = rospy.Subscriber("bounding_box",  Int16MultiArray, self.bb_callback, queue_size=1)
+    self.homography = None
+
+    self.input_image_compressed = "/pi3a/image/compressed"
+    self.current_image = CompressedImage()
+
+    self.subscriber = rospy.Subscriber(self.input_image_compressed,  CompressedImage, self.cal_im_callback, queue_size=1)
+    self.mouseX = 100
+    self.mouseY = 100
+
+  def bb_callback(self, ros_data):
     self.bounding_box = ros_data.data
 
+  def cal_im_callback(self, ros_data):
+    self.current_image = ros_data
+
   def transform(self, x1, y1):
-    return self.R.dot([x1-self.x0, y1-self.y0]/self.scale)
+    if self.homography is not None:
+      a = np.array([[x1, y1]], dtype='float32')
+      return cv2.perspectiveTransform(a[None, :, :], self.homography)[0][0]
+    else:
+      raise ValueError('run or load calibration first!')
 
   def transform_bb(self):
     x, y = self.bounding_box_center()
@@ -68,64 +82,167 @@ class BraccioXYBBTargetInterface(object):
     y = (self.bounding_box[2]+self.bounding_box[4])/2
     return x, y
 
+
+  def draw_circle(self,event,x,y,flags,param):
+    if event == cv2.EVENT_LBUTTONDBLCLK:
+      self.mouseX, self.mouseY = x,y
+
+  def wait_for_image_click(self):
+    self.mouseX, self.mouseY = None, None
+    while(True):
+      np_arr = np.fromstring(self.current_image.data, np.uint8)
+      img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+      if self.mouseX:
+        cv2.circle(img,(self.mouseX, self.mouseY),10,(255,0,0),-1)
+      cv2.imshow('image',img)
+      k = cv2.waitKey(20) & 0xFF
+      if self.mouseX or k == ord('p'):
+          break
+    return self.mouseX, self.mouseY
+
   def calibrate(self):
-    print 'place apple at base, when ready press enter'
-    raw_input()
+    cv2.namedWindow('image')
+    cv2.setMouseCallback('image',self.draw_circle)
+    while len(self.current_image.data) == 0:
+      time.sleep(10)
 
-    x0s = []
-    y0s = []
-    for i in range(10):
-      x, y = self.bounding_box_center()
-      x0s.append(x)
-      y0s.append(y)
-      time.sleep(1)
+    src_pts = []
+    dst_angs = []
+    mouseX = None
+    while not mouseX:
+      print 'click on robot base.'
+      mouseX, mouseY = self.wait_for_image_click()
+    src_pts.append([mouseX,mouseY])
 
-    x0 = np.mean(x0s)
-    y0 = np.mean(y0s)
-    print 'place apple at furthest extent centered, when ready press enter'
-    raw_input()
+    N = 8
+    phi_min = np.pi/6
+    phi_max = np.pi - np.pi/6
+    for i in range(2,N):
+      print 'click on location, press p to pass.'
+      self.go_to_raise()
+      if i % 2 == 0:
+        rand_phi = phi_min + i*(phi_max-phi_min)/N
+        theta_shoulder = THETA_RET
+      else:
+        theta_shoulder = THETA_EXT
+      theta_wrist, theta_elbow = get_other_angles(theta_shoulder)
+      rand_targ = [rand_phi,theta_shoulder,theta_elbow, theta_wrist]
+      self.go_to_joint(rand_targ)
+      mouseX, mouseY = self.wait_for_image_click()
+      if mouseX:
+        src_pts.append([mouseX,mouseY])
+        dst_angs.append(rand_targ)
+    with open('calibration.json', 'w') as f:
+      json.dump({'src_pts':src_pts,'dst_angs':dst_angs},f)
+    self.load_calibrate()
 
-    x1s = []
-    y1s = []
-    for i in range(10):
-      x, y = self.bounding_box_center()
-      x1s.append(x)
-      y1s.append(y)
-      time.sleep(1)
-    x1 = np.mean(x1s)
-    y1 = np.mean(y1s)
+  def load_calibrate(self):
+    with open('calibration.json', 'r') as f:
+      calib = json.load(f)
+    src_pts = calib['src_pts']
+    dst_angs = calib['dst_angs']
 
-    self.x0 = x0
-    self.y0 = y0
+    s_ret_pts = src_pts[1::2]
+    s_ext_pts = src_pts[2::2]
+    arr = np.array(s_ret_pts)-np.array(s_ext_pts)
+    self.L = np.sqrt((arr*arr).sum(axis=1)).mean()/(np.cos(THETA_EXT)-np.cos(THETA_RET))
+    arr = np.array(s_ret_pts)-np.array(src_pts[0])
+    l1 = np.sqrt((arr*arr).sum(axis=1)).mean() - self.L*np.cos(THETA_RET)
+    arr = np.array(s_ext_pts)-np.array(src_pts[0])
+    l2 = np.sqrt((arr*arr).sum(axis=1)).mean() - self.L*np.cos(THETA_EXT)
+    self.l = (l1+l2)/2
 
-    ang = np.arctan2(1,0) - np.arctan2(y1-y0,x1-x0)
-    self.R = np.array([[np.cos(ang),-np.sin(ang)],[np.sin(ang),np.cos(ang)]])
-    v = np.array([x1-self.x0,y1-self.y0])
-    self.scale = np.sqrt(v.dot(v.T))
-    print 'calibration done.'
-    print self.transform_bb()
+    print 'l = ' + str(self.l)
+    print 'L = ' + str(self.L)
 
-  def go_to(self, x, y):
+    dst_pts = [[0,0]]
+    for i in range(len(dst_angs)):
+      phi = dst_angs[i][0]
+      rho = self.L*np.cos(dst_angs[i][1]) + self.l
+      x, y = pol2cart(rho, phi)
+      dst_pts.append([x,y])
 
-    joint_targets = get_targets(x,y)
+    print src_pts
+    print dst_pts
+
+    src_pts = np.array(src_pts)
+    dst_pts = np.array(dst_pts)
+
+    h, status = cv2.findHomography(src_pts, dst_pts)
+    self.homography = h
+
+    print 'calibration done. transformed_bb:'
+    self.print_pose()
+    cv2.destroyAllWindows()
+    self.go_to_up()
+
+  def go_to_joint(self, joint_targets):
+    joint_goal = self.move_group.get_current_joint_values()
+    joint_goal[0] = joint_targets[0]
+    joint_goal[1] = joint_targets[1]
+    joint_goal[2] = joint_targets[2]
+    joint_goal[3] = joint_targets[3]
+    joint_goal[4] = 1.5708
+    self.move_group.go(joint_goal, wait=True)
+    self.move_group.stop()
+
+  def gripper_close(self):
+    self.go_gripper(0.9)
+
+  def gripper_open(self):
+    self.go_gripper(0.2)
+
+  def go_gripper(self, val):
+    joint_goal = self.gripper_group.get_current_joint_values()
+    joint_goal[0] = val
+    joint_goal[1] = val
+    print joint_goal
+    self.gripper_group.go(joint_goal, wait=True)
+    self.gripper_group.stop()
+
+  def go_to_raise(self):
+    joint_goal = self.move_group.get_current_joint_values()
+    joint_goal[1] = 1.15
+    joint_goal[2] = 0.13
+    joint_goal[3] = 2.29
+    self.go_to_joint(joint_goal)
+
+  def get_targets(self,x,y):
+    s, phi = cart2pol(x,y)
+    print 's = ' + str(s)
+    print 'l = ' + str(self.l)
+    print 'L = ' + str(self.L)
+
+    theta_shoulder = np.arccos((s - self.l)/self.L)
+    if theta_shoulder < THETA_EXT or theta_shoulder > THETA_RET:
+      print '++++++ Not in Domain ++++++'
+      print 's = ' + str(s)
+      print 'theta = ' + str(theta_shoulder)
+      print '++++++ Not in Domain ++++++'
+      return None
+
+    theta_wrist, theta_elbow = get_other_angles(theta_shoulder)
+    return [phi, theta_shoulder, theta_elbow, theta_wrist]
+
+  def go_to_xy(self, x, y):
+    joint_targets = self.get_targets(x,y)
 
     print joint_targets
     if joint_targets:
+        self.go_to_raise()
+        self.gripper_open()
         joint_goal = self.move_group.get_current_joint_values()
-        joint_goal[0] = joint_targets[0]
-        self.move_group.go(joint_goal, wait=True)
 
-        self.move_group.stop()
+        joint_goal[0] = float(joint_targets[0])
+        self.go_to_joint(joint_goal)
 
-        joint_goal[1] = joint_targets[1]
-        joint_goal[2] = joint_targets[2]
-        joint_goal[3] = joint_targets[3]
+        joint_goal[1] = float(joint_targets[1])
+        joint_goal[2] = float(joint_targets[2])
+        joint_goal[3] = float(joint_targets[3])
+        self.go_to_joint(joint_goal)
+        self.gripper_close()
 
-        self.move_group.go(joint_goal, wait=True)
-
-        self.move_group.stop()
-
-  def go_to_joint_state(self):
+  def go_to_manual(self):
 
     print 'pos x?'
     tst = raw_input()
@@ -136,31 +253,26 @@ class BraccioXYBBTargetInterface(object):
     if tst!='':
         y = float(tst)
 
-    self.go_to(x, y)
+    self.go_to_xy(x, y)
 
-  def go_to_target_joint_state(self):
+  def go_to_target(self):
     v = self.transform_bb()
-    self.go_to(v[0], v[1])
+    print v
+    self.go_to_xy(v[0], v[1])
+    self.go_to_home()
 
-  def go_to_home_state(self):
+  def go_to_home(self):
 
-    joint_goal = self.move_group.get_current_joint_values()
-    joint_goal[1] = 1.15
-    joint_goal[2] = 0.13
-    joint_goal[3] = 2.29
-
-    self.move_group.go(joint_goal, wait=True)
-
-    self.move_group.stop()
+    self.go_to_raise()
 
     joint_goal = self.move_group.get_current_joint_values()
     joint_goal[0] = 3.14
 
-    self.move_group.go(joint_goal, wait=True)
+    self.go_to_joint(joint_goal)
+    self.gripper_open()
 
-    self.move_group.stop()
-
-  def go_to_up_state(self):
+  def go_to_up(self):
+    self.go_to_raise()
 
     joint_goal = self.move_group.get_current_joint_values()
     joint_goal[0] = 1.5708
@@ -168,43 +280,37 @@ class BraccioXYBBTargetInterface(object):
     joint_goal[2] = 1.5708
     joint_goal[3] = 1.5708
 
-    self.move_group.go(joint_goal, wait=True)
-
-    self.move_group.stop()
-
+    self.go_to_joint(joint_goal)
 
   def print_pose(self):
-    print self.move_group.get_current_pose().pose
+    print self.gripper_group.get_current_joint_values()
     x, y = self.bounding_box_center()
     print x, y
     print self.transform(x, y)
 
 def main():
-  try:
-    bb_targetter = BraccioXYBBTargetInterface()
+  bb_targetter = BraccioXYBBTargetInterface()
 
-    while True:
-        print "============ instructions: p=print, c=calibrate, t=target, m=manual, h=home, u=up, q=quit"
-        inp = raw_input()
-        if inp=='q':
-            break
-        if inp=='p':
-            bb_targetter.print_pose()
-        if inp=='c':
-            bb_targetter.calibrate()
-        if inp=='t':
-            bb_targetter.go_to_target_joint_state()
-        if inp=='m':
-            bb_targetter.go_to_joint_state()
-        if inp=='h':
-            bb_targetter.go_to_home_state()
-        if inp=='u':
-            bb_targetter.go_to_up_state()
+  while True:
+      print "============ instructions: p=print, c=calibrate, l=load_calibration, t=target, m=manual, h=home, u=up, q=quit"
+      inp = raw_input()
+      if inp=='q':
+          break
+      if inp=='p':
+          bb_targetter.print_pose()
+      if inp=='c':
+          bb_targetter.calibrate()
+      if inp=='l':
+          bb_targetter.load_calibrate()
+      if inp=='t':
+          bb_targetter.go_to_target()
+      if inp=='m':
+          bb_targetter.go_to_manual()
+      if inp=='h':
+          bb_targetter.go_to_home()
+      if inp=='u':
+          bb_targetter.go_to_up()
 
-  except rospy.ROSInterruptException:
-    return
-  except KeyboardInterrupt:
-    return
 
 if __name__ == '__main__':
   main()
